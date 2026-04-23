@@ -1,0 +1,10 @@
+# --- Primary reader (free, recommended) ---
+google-generativeai>=0.8.0
+
+# --- Optional AI reader (paid) ---
+# anthropic>=0.40.0
+
+# --- Tesseract offline fallback ---
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+pypdf>=4.0.0
