@@ -102,23 +102,27 @@ JSON (no prose, no markdown fences, no comments):
 }
 
 Rules:
-- file_type mapping:
-    * "Personal Care Services" / "PCS Activity Sheet" / "PCS Notes" -> "PCS"
+- file_type — determined ONLY by the form's title / header line:
+    * "PCS Activity Sheet" / "PCS Notes" / "Personal Care Services" -> "PCS"
     * "In-Home Respite" / "Respite Care" -> "IHR"
     * "Transportation" / "Trip Log" / "Mileage Log" -> "Trans"
-    * "Timesheet" / "Bi-Weekly Time Entry" / "Payroll" -> "TS"
-  Prefer the service type (PCS/IHR/Trans) over "TS" even if "timesheet"
-  appears, as long as a specific service is named on the form.
+    * "Employee Bi-Weekly Time Entry" / "Timesheet" / "Payroll" -> "TS"
+  Use ONLY the printed title/header to decide; ignore service-type words
+  (e.g. "In Home Respite", "PCS") that appear inside date rows or notes —
+  those are service codes logged within the sheet, not the form type.
 
 - full_name:
-    * For PCS/IHR/Trans forms return the CLIENT name (not the caregiver/worker name).
-    * For TS forms return the EMPLOYEE name (not the supervisor/client name).
-    * If both appear, still return only the one dictated by the rule above.
+    * For PCS/IHR/Trans forms: return the name from the "Client Name:" field.
+    * For TS forms: return the name from the "Employee Name:" field.
+      Do NOT use any "Client Name:", "WEEK 1 Client Name:", or similar field
+      — those are client names and must be ignored for TS forms.
     * CRITICAL: Transcribe the name EXACTLY as it is written on the form.
-      Do NOT correct, substitute, reorder, or guess any part of the name.
-      Only fix stray non-letter characters (digits, punctuation) caused by
+      Do NOT substitute a different name, invent letters that are not visible,
+      or reorder the words. When a letter is ambiguous, write your best reading
+      of it — never return null simply because the handwriting is difficult.
+      Only remove stray non-letter characters (digits, punctuation) caused by
       scan noise; capitalise each word.
-    * Return null if the name field is blank or illegible.
+    * Return null ONLY if the relevant name field is entirely blank.
 
 - dates:
     * Every service date that is filled in on the form (skip blank/empty rows).
@@ -126,6 +130,15 @@ Rules:
       Do NOT default to the current year or infer the year from context.
     * ISO format: "YYYY-MM-DD".  Expand two-digit years with 2000
       (e.g. "26" -> 2026, "24" -> 2024).
+    * Handwriting caution: dates are written M-D-YY. The day part may be
+      1 OR 2 digits (e.g. "1", "23", "31"). Read each digit separately and
+      carefully — "31" is NOT "3" followed by a stray mark; "1" as a day means
+      the 1st of the month, not the 2nd. When uncertain between two adjacent
+      digit values (e.g. "1" vs "2"), prefer the lower one for day numbers,
+      since writers tend to make small digits look larger than they are.
+    * On PCS Activity Sheets the form prints day-of-week labels (Sunday …
+      Saturday) in order; dates in consecutive filled rows should be
+      approximately sequential. Use this as a sanity check on what you read.
     * Sort ascending, deduplicate.
     * Return [] if none are legible.
 
