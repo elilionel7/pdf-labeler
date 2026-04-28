@@ -35,6 +35,7 @@ from formatter import FileLabel, VALID_TYPES
 
 SETTINGS_DIR = Path.home() / ".pdf-labeler"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+NAMES_FILE = SETTINGS_DIR / "names.txt"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "provider":  "gemini",     # "gemini" | "claude" | "tesseract"
@@ -43,6 +44,23 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "claude_api_key": "",
     "claude_model": "claude-haiku-4-5",
 }
+
+
+def load_known_names() -> List[str]:
+    """Return the list of known names from ~/.pdf-labeler/names.txt."""
+    if not NAMES_FILE.exists():
+        return []
+    try:
+        with NAMES_FILE.open("r") as fh:
+            return [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def save_known_names(names: List[str]) -> None:
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    with NAMES_FILE.open("w") as fh:
+        fh.write("\n".join(n.strip() for n in names if n.strip()))
 
 
 def load_settings() -> Dict[str, Any]:
@@ -145,6 +163,23 @@ Rules:
 Return ONLY the JSON object, nothing else.
 """
 
+_NAMES_HINT = """\
+
+- known names: The following words are known to appear on these forms
+  (first names, last names, or both — any fragment is valid).
+  When handwriting is ambiguous and what you see could plausibly match
+  one of these, prefer that spelling exactly as listed:
+  {names_list}
+"""
+
+
+def build_prompt(known_names: List[str] = ()) -> str:
+    """Return the user prompt, optionally with a known-names hint appended."""
+    if not known_names:
+        return USER_PROMPT
+    names_list = ", ".join(f'"{n}"' for n in known_names)
+    return USER_PROMPT + _NAMES_HINT.format(names_list=names_list)
+
 
 # ---------------------------------------------------------------------------
 # Shared response parsing
@@ -214,12 +249,13 @@ def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     with open(pdf_path, "rb") as fh:
         pdf_bytes = fh.read()
 
+    prompt = build_prompt(load_known_names())
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(3):
         try:
             response = model.generate_content([
                 {"mime_type": "application/pdf", "data": pdf_bytes},
-                USER_PROMPT,
+                prompt,
             ])
             break
         except Exception as e:
@@ -276,7 +312,7 @@ def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
                  "source": {"type": "base64",
                             "media_type": "application/pdf",
                             "data": pdf_b64}},
-                {"type": "text", "text": USER_PROMPT},
+                {"type": "text", "text": build_prompt(load_known_names())},
             ],
         }],
     )

@@ -163,6 +163,52 @@ class SettingsDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# Names dialog
+# ---------------------------------------------------------------------------
+
+class NamesDialog(tk.Toplevel):
+    """Edit the list of known names used to guide handwriting recognition."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Known Names")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self.geometry("420x420")
+
+        ttk.Label(self, text=(
+            "One name per line.  These are sent to the AI as hints when\n"
+            "reading ambiguous handwriting.  Include both clients and employees."
+        ), justify="left").pack(anchor="w", padx=10, pady=(10, 4))
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        self._text = tk.Text(frame, wrap="word", font=("TkFixedFont", 12))
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self._text.yview)
+        self._text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self._text.pack(side="left", fill="both", expand=True)
+
+        names = ai_reader.load_known_names()
+        self._text.insert("1.0", "\n".join(names))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Save",   command=self._save).pack(side="right")
+
+        self.wait_window()
+
+    def _save(self) -> None:
+        raw = self._text.get("1.0", "end")
+        names = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        ai_reader.save_known_names(names)
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -188,6 +234,7 @@ class LabelerApp(tk.Tk):
         ttk.Button(top, text="Add Folder",       command=self.add_folder).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear",            command=self.clear_rows).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Re-scan Selected", command=self.rescan_selected).pack(side="left", padx=(20, 0))
+        ttk.Button(top, text="Names…",           command=self.open_names).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Settings…",        command=self.open_settings).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Apply Rename",     command=self.apply_rename).pack(side="right")
 
@@ -243,6 +290,10 @@ class LabelerApp(tk.Tk):
         self.reader_var.set(text)
 
     # ---- Settings --------------------------------------------------------
+
+    def open_names(self) -> None:
+        NamesDialog(self)
+        self.status_var.set("Known names updated.")
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self, self.settings)
