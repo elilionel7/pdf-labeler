@@ -26,9 +26,11 @@ class TestDateFormatting(unittest.TestCase):
         with self.assertRaises(ValueError):
             format_dates([])
 
-    def test_rejects_mixed_years(self):
-        with self.assertRaises(ValueError):
-            format_dates([date(2025, 12, 30), date(2026, 1, 2)])
+    def test_cross_year_span(self):
+        """Bi-weekly TS straddling year-end keeps a -YY per month group."""
+        dates = [date(2025, 12, 29), date(2025, 12, 30), date(2025, 12, 31),
+                 date(2026, 1, 1),  date(2026, 1, 2),  date(2026, 1, 5)]
+        self.assertEqual(format_dates(dates), "12-29,30,31-25_1-1,2,5-26")
 
 
 class TestNameCleaning(unittest.TestCase):

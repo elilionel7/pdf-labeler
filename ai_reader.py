@@ -36,6 +36,7 @@ from formatter import FileLabel, VALID_TYPES
 SETTINGS_DIR = Path.home() / ".pdf-labeler"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 NAMES_FILE = SETTINGS_DIR / "names.txt"
+CLIENTS_FILE = SETTINGS_DIR / "clients.txt"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "provider":  "gemini",     # "gemini" | "claude" | "tesseract"
@@ -43,12 +44,65 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gemini_model": "gemini-2.5-flash",
     "claude_api_key": "",
     "claude_model": "claude-haiku-4-5",
+    # Hint for handwriting-ambiguous year digits. A single year ("2026") or
+    # a range ("2025-2026") for forms that may straddle Dec/Jan. Empty = off.
+    "expected_years": "2026",
+    # Same idea for months — handwritten 1/7, 4/9, 3/8 confuse the reader.
+    # Accepts "5", "4-6", "1,3,5" or "1-3,5,7-9". Empty = off (no constraint).
+    "expected_months": "",
 }
 
 
+def parse_year_range(text: str):
+    """Parse '2026' or '2025-2026' (also en-dash) into (low, high). None on miss."""
+    if not text:
+        return None
+    s = text.strip().replace("–", "-").replace("—", "-")
+    m = re.match(r"^(\d{4})\s*(?:-\s*(\d{4}))?$", s)
+    if not m:
+        return None
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    if lo > hi:
+        lo, hi = hi, lo
+    return (lo, hi)
+
+
+def parse_month_set(text: str):
+    """Parse '5', '4-6', '1,3,5' or '1-3,5,7-9' into a sorted set of months.
+    Returns None if the field is empty or any token is invalid."""
+    if not text or not text.strip():
+        return None
+    s = text.strip().replace("–", "-").replace("—", "-")
+    out: set = set()
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(r"^(\d{1,2})\s*(?:-\s*(\d{1,2}))?$", chunk)
+        if not m:
+            return None
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) else lo
+        if lo > hi:
+            lo, hi = hi, lo
+        if not (1 <= lo <= 12 and 1 <= hi <= 12):
+            return None
+        out.update(range(lo, hi + 1))
+    return sorted(out) or None
+
+
 def load_known_names() -> List[str]:
-    """Return the list of known names from ~/.pdf-labeler/names.txt."""
+    """Return the list of known names from ~/.pdf-labeler/names.txt.
+
+    Bootstraps from a names.docx sitting next to the app on first run, so the
+    user gets the roster automatically without clicking Import.
+    """
     if not NAMES_FILE.exists():
+        bootstrapped = _bootstrap_from_local_docx()
+        if bootstrapped:
+            save_known_names(bootstrapped)
+            return bootstrapped
         return []
     try:
         with NAMES_FILE.open("r") as fh:
@@ -61,6 +115,117 @@ def save_known_names(names: List[str]) -> None:
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     with NAMES_FILE.open("w") as fh:
         fh.write("\n".join(n.strip() for n in names if n.strip()))
+
+
+def names_from_docx(path: str) -> List[str]:
+    """Parse a roster .docx. Tables: join cells in each row as 'First Last'.
+    Paragraphs: each non-empty line becomes one entry."""
+    try:
+        from docx import Document
+    except ImportError as e:
+        raise ImportError(
+            "Reading .docx rosters needs 'python-docx'.\n"
+            "Install with:  pip install python-docx"
+        ) from e
+
+    doc = Document(path)
+    out: List[str] = []
+    seen: set = set()
+
+    def add(value: str) -> None:
+        v = " ".join(value.split())
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+
+    for table in doc.tables:
+        for row in table.rows:
+            parts = [c.text.strip() for c in row.cells if c.text.strip()]
+            if not parts:
+                continue
+            add(" ".join(parts))
+    for para in doc.paragraphs:
+        if para.text.strip():
+            add(para.text)
+    return out
+
+
+def _bootstrap_from_local_docx() -> List[str]:
+    """Look for a names.docx next to the app (or in CWD) and parse it.
+    Returns [] on any failure — bootstrap is best-effort."""
+    candidates = [
+        Path(__file__).resolve().parent / "names.docx",
+        Path.cwd() / "names.docx",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                return names_from_docx(str(path))
+            except Exception:
+                return []
+    return []
+
+
+# --- Clients roster (for PCS / IHR / Trans / E&D forms) -------------------
+#
+# names.txt holds EMPLOYEES (used on TS forms). clients.txt holds the people
+# who receive the service (the "Client Name:" on the other four form types).
+# Separating them keeps each prompt short and stops the model from biasing a
+# client read toward an employee spelling, or vice versa.
+
+def load_known_clients() -> List[str]:
+    if not CLIENTS_FILE.exists():
+        bootstrapped = _bootstrap_clients_from_hpscans()
+        if bootstrapped:
+            save_known_clients(bootstrapped)
+            return bootstrapped
+        return []
+    try:
+        with CLIENTS_FILE.open("r") as fh:
+            return [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def save_known_clients(clients: List[str]) -> None:
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    with CLIENTS_FILE.open("w") as fh:
+        fh.write("\n".join(c.strip() for c in clients if c.strip()))
+
+
+def _bootstrap_clients_from_hpscans() -> List[str]:
+    """Extract client names from manually-labeled filenames in HPSCANS/.
+
+    Files are named '<First Last>_<TYPE>_<dates>.pdf'; the first underscore-
+    separated chunk of any PCS/IHR/Trans/E&D file is a client name we can
+    reuse as a roster entry. TS files are skipped (those are employees)."""
+    candidates = [
+        Path(__file__).resolve().parent / "HPSCANS",
+        Path.cwd() / "HPSCANS",
+    ]
+    client_types = {"PCS", "IHR", "Trans", "E&D"}
+    seen: set = set()
+    out: List[str] = []
+    for dir_path in candidates:
+        if not dir_path.is_dir():
+            continue
+        for pdf in dir_path.glob("*.pdf"):
+            stem = pdf.stem  # strip .pdf
+            parts = re.split(r"[_-]", stem, maxsplit=2)
+            if len(parts) < 2:
+                continue
+            name, ftype = parts[0].strip(), parts[1].strip()
+            if ftype not in client_types or not name:
+                continue
+            canon = " ".join(name.split())
+            key = canon.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(canon)
+        if out:
+            return sorted(out, key=str.lower)
+    return []
 
 
 def load_settings() -> Dict[str, Any]:
@@ -114,7 +279,7 @@ This PDF is a scanned form. Extract the following fields and return ONLY
 JSON (no prose, no markdown fences, no comments):
 
 {
-  "file_type": "PCS" | "IHR" | "Trans" | "TS" | null,
+  "file_type": "PCS" | "IHR" | "Trans" | "TS" | "E&D" | null,
   "full_name": "Firstname Lastname" | null,
   "dates":     ["YYYY-MM-DD", ...]
 }
@@ -125,12 +290,15 @@ Rules:
     * "In-Home Respite" / "Respite Care" -> "IHR"
     * "Transportation" / "Trip Log" / "Mileage Log" -> "Trans"
     * "Employee Bi-Weekly Time Entry" / "Timesheet" / "Payroll" -> "TS"
+    * "Parkway Medical Group E&D Waiver Supervisory Visit Form" or any
+      header containing "E&D Waiver" -> "E&D"
   Use ONLY the printed title/header to decide; ignore service-type words
   (e.g. "In Home Respite", "PCS") that appear inside date rows or notes —
   those are service codes logged within the sheet, not the form type.
 
 - full_name:
-    * For PCS/IHR/Trans forms: return the name from the "Client Name:" field.
+    * For PCS / IHR / Trans / E&D forms: return the name from the
+      "Client Name:" (or "Patient Name:") field. These people are CLIENTS.
     * For TS forms: return the name from the "Employee Name:" field.
       Do NOT use any "Client Name:", "WEEK 1 Client Name:", or similar field
       — those are client names and must be ignored for TS forms.
@@ -163,22 +331,69 @@ Rules:
 Return ONLY the JSON object, nothing else.
 """
 
-_NAMES_HINT = """\
+_ROSTER_HINT = """\
 
-- known names: The following words are known to appear on these forms
-  (first names, last names, or both — any fragment is valid).
-  When handwriting is ambiguous and what you see could plausibly match
-  one of these, prefer that spelling exactly as listed:
-  {names_list}
+- rosters: Two lists below name people known to appear on these forms.
+  Match the file_type to the right list and prefer the EXACT spelling and
+  capitalisation from that list when the handwriting is plausibly one of its
+  entries (same starting letter(s), similar length, consistent strokes).
+  Do not invent variants. If nothing in the relevant list is a reasonable
+  match, transcribe what you actually see.
+
+  Employees (use ONLY when file_type is "TS"):
+  {employees_list}
+
+  Clients (use ONLY when file_type is "PCS", "IHR", "Trans", or "E&D"):
+  {clients_list}
+"""
+
+_YEAR_HINT_SINGLE = """\
+
+- expected service year: {year}.
+  When the year digits on the form are ambiguous (handwritten "26" is often
+  confused with "20", "28", "23"), prefer {year}. ONLY override this default
+  when you can clearly read a different and plausible year on the page (e.g.
+  a December {prior} form on a Dec→Jan bi-weekly timesheet).
+"""
+
+_YEAR_HINT_RANGE = """\
+
+- expected service years: {low}-{high}.
+  When the year digits on the form are ambiguous, prefer years in this range.
+  ONLY override when you can clearly read a different and plausible year.
+"""
+
+_MONTH_HINT = """\
+
+- expected service months: {months}.
+  When the month digit is ambiguous (handwritten 1/7, 4/9, 3/8, 5/6 are
+  commonly confused), prefer a month in this list. ONLY override when you
+  can clearly read a different and plausible month on the page.
 """
 
 
-def build_prompt(known_names: List[str] = ()) -> str:
-    """Return the user prompt, optionally with a known-names hint appended."""
-    if not known_names:
-        return USER_PROMPT
-    names_list = ", ".join(f'"{n}"' for n in known_names)
-    return USER_PROMPT + _NAMES_HINT.format(names_list=names_list)
+def build_prompt(
+    employees:  List[str] = (),
+    clients:    List[str] = (),
+    year_range: "tuple[int, int] | None" = None,
+    months:     "list[int] | None"       = None,
+) -> str:
+    """Return the user prompt with roster + year + month hints when provided."""
+    out = USER_PROMPT
+    if employees or clients:
+        out += _ROSTER_HINT.format(
+            employees_list=", ".join(f'"{n}"' for n in employees) or "(none provided)",
+            clients_list  =", ".join(f'"{n}"' for n in clients)   or "(none provided)",
+        )
+    if year_range is not None:
+        lo, hi = year_range
+        if lo == hi:
+            out += _YEAR_HINT_SINGLE.format(year=lo, prior=lo - 1)
+        else:
+            out += _YEAR_HINT_RANGE.format(low=lo, high=hi)
+    if months:
+        out += _MONTH_HINT.format(months=", ".join(str(m) for m in months))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +464,12 @@ def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     with open(pdf_path, "rb") as fh:
         pdf_bytes = fh.read()
 
-    prompt = build_prompt(load_known_names())
+    prompt = build_prompt(
+        load_known_names(),
+        load_known_clients(),
+        parse_year_range(settings.get("expected_years", "")),
+        parse_month_set(settings.get("expected_months", "")),
+    )
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(3):
         try:
@@ -312,7 +532,12 @@ def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
                  "source": {"type": "base64",
                             "media_type": "application/pdf",
                             "data": pdf_b64}},
-                {"type": "text", "text": build_prompt(load_known_names())},
+                {"type": "text", "text": build_prompt(
+                    load_known_names(),
+                    load_known_clients(),
+                    parse_year_range(settings.get("expected_years", "")),
+                    parse_month_set(settings.get("expected_months", "")),
+                )},
             ],
         }],
     )

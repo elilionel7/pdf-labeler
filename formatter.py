@@ -21,7 +21,7 @@ from datetime import date
 from typing import Iterable, List
 
 
-VALID_TYPES = {"PCS", "IHR", "Trans", "TS"}
+VALID_TYPES = {"PCS", "IHR", "Trans", "TS", "E&D"}
 
 
 @dataclass
@@ -64,11 +64,18 @@ def format_dates(dates: List[date]) -> str:
         raise ValueError("At least one date is required")
 
     groups = _group_by_month(dates)
-
     years = {y for (y, _m) in groups.keys()}
+
+    # Multi-year span (e.g. bi-weekly TS straddling year-end): each month
+    # group keeps its own -YY suffix, joined with underscores.
+    #   12-29,30,31-25_1-1,2,5-26
     if len(years) > 1:
-        raise ValueError(f"All dates must share one year; got years {sorted(years)}")
-    year = _two_digit_year(date(next(iter(years)), 1, 1))
+        return "_".join(
+            f"{m}-{','.join(str(d) for d in days)}-{y % 100:02d}"
+            for (y, m), days in groups.items()
+        )
+
+    year = f"{next(iter(years)) % 100:02d}"
 
     if len(groups) == 1:
         (_y, m), days = next(iter(groups.items()))
