@@ -18,6 +18,7 @@ Public API used by app.py:
 from __future__ import annotations
 
 import base64
+import difflib
 import json
 import os
 import re
@@ -228,6 +229,63 @@ def _bootstrap_clients_from_hpscans() -> List[str]:
     return []
 
 
+# --- Snap-to-roster fuzzy matching ----------------------------------------
+#
+# The prompt asks the model to prefer roster spellings, but nothing guarantees
+# it complies. This post-processing step makes the guarantee in code: if the
+# transcribed name is close enough to a roster entry, replace it with the
+# roster's exact spelling. The model only has to get *close*.
+
+SNAP_THRESHOLD = 0.80
+
+
+def roster_for_type(ftype: str) -> List[str]:
+    """Return the roster that applies to a form type (employees for TS,
+    clients for the rest), or [] when the type is unknown."""
+    if ftype == "TS":
+        return load_known_names()
+    if ftype in ("PCS", "IHR", "Trans", "E&D"):
+        return load_known_clients()
+    return []
+
+
+def _name_similarity(a: str, b: str) -> float:
+    direct = difflib.SequenceMatcher(None, a, b).ratio()
+    # Also compare with words sorted, so a reversed "Lastname Firstname"
+    # transcription still matches its roster entry.
+    sa = " ".join(sorted(a.split()))
+    sb = " ".join(sorted(b.split()))
+    return max(direct, difflib.SequenceMatcher(None, sa, sb).ratio())
+
+
+def snap_to_roster(
+    name: str,
+    ftype: str,
+    roster: "List[str] | None" = None,
+) -> "tuple[str, bool]":
+    """Fuzzy-match a transcribed name against the roster for this form type.
+
+    Returns (roster_spelling, True) when a confident match exists, otherwise
+    (name unchanged, False)."""
+    name = " ".join((name or "").split())
+    if not name:
+        return name, False
+    if roster is None:
+        roster = roster_for_type(ftype)
+    if not roster:
+        return name, False
+    target = name.lower()
+    best, best_score = "", 0.0
+    for entry in roster:
+        cand = " ".join(entry.split())
+        score = _name_similarity(target, cand.lower())
+        if score > best_score:
+            best, best_score = cand, score
+    if best and best_score >= SNAP_THRESHOLD:
+        return best, True
+    return name, False
+
+
 def load_settings() -> Dict[str, Any]:
     settings = dict(DEFAULT_SETTINGS)
     try:
@@ -431,6 +489,7 @@ def _label_from_data(data: Dict[str, Any], source_path: str) -> FileLabel:
     if ftype not in VALID_TYPES:
         ftype = ""
     name = (data.get("full_name") or "").strip()
+    name, _ = snap_to_roster(name, ftype)
     dates = _to_dates(data.get("dates") or [])
     return FileLabel(
         full_name=name,

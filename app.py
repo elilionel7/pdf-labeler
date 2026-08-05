@@ -13,6 +13,7 @@ Workflow:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -20,7 +21,7 @@ import tkinter as tk
 from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import ai_reader
 from extractor import analyze as tesseract_analyze
@@ -61,6 +62,66 @@ def parse_dates_field(raw: str) -> List[date]:
         except ValueError:
             pass
     return out
+
+
+# ---------------------------------------------------------------------------
+# Queue persistence
+# ---------------------------------------------------------------------------
+#
+# The queue survives app restarts so users don't lose in-progress work. On
+# restore, each row's file is fingerprinted (size + mtime) and compared to the
+# saved fingerprint — this catches the "same filename, different scan" case
+# where trusting the old label would mis-file a fresh document.
+
+QUEUE_FILE = Path.home() / ".pdf-labeler" / "queue.json"
+
+
+def _file_fingerprint(path: str) -> Optional[Dict[str, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    # int(mtime) — sub-second precision isn't stable across filesystems and
+    # would trigger spurious "changed" flags after a copy.
+    return {"size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def _serialize_rows(rows: List["Row"]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        fp = _file_fingerprint(r.path)
+        out.append({
+            "path":   r.path,
+            "name":   r.name,
+            "ftype":  r.ftype,
+            "dates":  [d.isoformat() for d in r.dates],
+            "status": r.status,
+            "size":   fp["size"]  if fp else None,
+            "mtime":  fp["mtime"] if fp else None,
+        })
+    return out
+
+
+def _persist_queue(rows: List["Row"]) -> None:
+    """Best-effort save of the current row list to ~/.pdf-labeler/queue.json.
+    Silently swallows I/O errors — persistence must never crash the app."""
+    try:
+        QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with QUEUE_FILE.open("w") as fh:
+            json.dump(_serialize_rows(rows), fh, indent=2)
+    except OSError:
+        pass
+
+
+def _load_persisted_queue() -> List[Dict[str, Any]]:
+    if not QUEUE_FILE.exists():
+        return []
+    try:
+        with QUEUE_FILE.open("r") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -559,8 +620,13 @@ class LabelerApp(tk.Tk):
         self.geometry("1200x640")
         self.rows: List[Row] = []
         self.settings = ai_reader.load_settings()
+        # Pause gate — worker threads block on this before each file. Set =
+        # running, cleared = paused. Starts running so first batch just flows.
+        self._pause_event = threading.Event()
+        self._pause_event.set()
         self._build_ui()
         self._update_reader_label()
+        self._restore_queue()
 
     # ---- UI construction -------------------------------------------------
 
@@ -572,6 +638,8 @@ class LabelerApp(tk.Tk):
         ttk.Button(top, text="Add Folder",       command=self.add_folder).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear",            command=self.clear_rows).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Re-scan Selected", command=self.rescan_selected).pack(side="left", padx=(20, 0))
+        self._pause_btn = ttk.Button(top, text="Pause", command=self._toggle_pause)
+        self._pause_btn.pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clients…",         command=self.open_clients).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Employees…",       command=self.open_names).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Settings…",        command=self.open_settings).pack(side="right", padx=(6, 0))
@@ -647,6 +715,121 @@ class LabelerApp(tk.Tk):
         NamesDialog(self, kind="clients")
         self.status_var.set("Clients roster saved.")
 
+    def _toggle_pause(self) -> None:
+        if self._pause_event.is_set():
+            self._pause_event.clear()
+            self._pause_btn.configure(text="Resume")
+            self._set_global_status(
+                "Paused. Current file will finish, then processing stops."
+            )
+        else:
+            self._pause_event.set()
+            self._pause_btn.configure(text="Pause")
+            # Worker (if any) picks up on next iteration.
+
+    # ---- Queue restore ---------------------------------------------------
+
+    _STATUS_TAG = {
+        "ok": "ok",
+        "renamed": "renamed",
+        "missing": "error",
+        "changed — re-scan": "review",
+    }
+
+    def _tag_for_status(self, status: str) -> str:
+        if status in self._STATUS_TAG:
+            return self._STATUS_TAG[status]
+        if status.startswith("review"):
+            return "review"
+        if status.startswith("error"):
+            return "error"
+        return ""
+
+    def _restore_queue(self) -> None:
+        """Rehydrate rows from ~/.pdf-labeler/queue.json. Runs on startup.
+
+        Reconciliation rules:
+        - status == "renamed" AND file gone   → drop silently (job done).
+        - file gone otherwise                 → keep as "missing" (red) so
+                                                nothing quietly disappears.
+        - file present, fingerprint differs   → "changed — re-scan" (yellow),
+                                                Name/Type/Dates cleared.
+        - file present, fingerprint matches   → restore verbatim.
+        Transient statuses ("reading…", "queued") come back as "queued".
+        """
+        saved = _load_persisted_queue()
+        if not saved:
+            return
+        restored = missing = changed = 0
+        for entry in saved:
+            path = entry.get("path", "")
+            saved_status = entry.get("status", "")
+            if not isinstance(path, str) or not path:
+                continue
+
+            file_exists = os.path.isfile(path)
+
+            # Completed jobs whose file is gone: drop. Any other absence keeps
+            # the row so the user can see what went missing.
+            if not file_exists and saved_status == "renamed":
+                continue
+
+            row = Row(path)
+            row.name  = entry.get("name", "") or ""
+            row.ftype = entry.get("ftype", "") or ""
+            row.dates = []
+            for s in entry.get("dates", []) or []:
+                try:
+                    row.dates.append(date.fromisoformat(s))
+                except (TypeError, ValueError):
+                    pass
+
+            if not file_exists:
+                row.status = "missing"
+                missing += 1
+            else:
+                fp    = _file_fingerprint(path)
+                saved_size  = entry.get("size")
+                saved_mtime = entry.get("mtime")
+                content_changed = (
+                    fp is not None and saved_size is not None
+                    and saved_mtime is not None
+                    and (fp["size"] != saved_size or fp["mtime"] != saved_mtime)
+                )
+                if content_changed:
+                    # New scan behind an old row — clear the label so we don't
+                    # apply the previous filename to a different document.
+                    row.name  = ""
+                    row.ftype = ""
+                    row.dates = []
+                    row.status = "changed — re-scan"
+                    changed += 1
+                elif saved_status in ("reading…", "queued", ""):
+                    row.status = "queued"
+                    restored += 1
+                else:
+                    row.status = saved_status
+                    restored += 1
+
+            proposed = row.proposed_filename() or ""
+            iid = self.tree.insert("", "end", values=(
+                os.path.basename(row.path),
+                row.name, row.ftype,
+                dates_to_string(row.dates),
+                proposed, row.status,
+            ))
+            row.iid = iid
+            tag = self._tag_for_status(row.status)
+            if tag:
+                self.tree.item(iid, tags=(tag,))
+            self.rows.append(row)
+
+        if restored or missing or changed:
+            parts = [f"restored {restored}"]
+            if changed: parts.append(f"{changed} changed on disk")
+            if missing: parts.append(f"{missing} missing")
+            self._set_global_status("Queue: " + ", ".join(parts) + ".")
+
     def open_settings(self) -> None:
         dlg = SettingsDialog(self, self.settings)
         if dlg.result is not None:
@@ -682,6 +865,9 @@ class LabelerApp(tk.Tk):
             ))
             row.iid = iid
             self.rows.append(row)
+        # Persist immediately so a crash between here and first _refresh_row
+        # still preserves the file list.
+        _persist_queue(self.rows)
         threading.Thread(target=self._process_rows, args=(new,), daemon=True).start()
 
     # ---- Background processing ------------------------------------------
@@ -697,6 +883,14 @@ class LabelerApp(tk.Tk):
     def _process_rows(self, paths: List[str]) -> None:
         path_to_row = {r.path: r for r in self.rows}
         for p in paths:
+            # Block here when paused. Only the NEXT file waits — a file already
+            # mid-analysis will finish its AI call before we get back to this
+            # check. Deliberate trade-off: keeps the worker simple and avoids
+            # dropping half-processed results.
+            if not self._pause_event.is_set():
+                self._set_global_status("Paused. Click Resume to continue.")
+                self._pause_event.wait()
+                self._set_global_status("Resumed.")
             row = path_to_row.get(p)
             if row is None:
                 continue
@@ -723,6 +917,10 @@ class LabelerApp(tk.Tk):
         """Compute the post-analysis status for a row, including date-range review."""
         if not row.proposed_filename():
             return "incomplete"
+        roster = ai_reader.roster_for_type(row.ftype)
+        if roster and row.name and \
+                row.name.lower() not in {n.lower() for n in roster}:
+            return "review: name not on roster"
         yr = ai_reader.parse_year_range(self.settings.get("expected_years", ""))
         if yr is not None:
             lo, hi = yr
@@ -744,11 +942,7 @@ class LabelerApp(tk.Tk):
         proposed = row.proposed_filename() or ""
         if status is not None:
             row.status = status
-        tag = ""
-        if   row.status == "ok":      tag = "ok"
-        elif row.status == "renamed": tag = "renamed"
-        elif row.status.startswith("review"): tag = "review"
-        elif row.status.startswith("error"):  tag = "error"
+        tag = self._tag_for_status(row.status)
 
         def update():
             self.tree.item(row.iid, values=(
@@ -762,6 +956,9 @@ class LabelerApp(tk.Tk):
             # keystroke wipes the field being typed into.
             if update_preview and self.preview._row is row:
                 self.preview.refresh_from_row()
+            # Persist here (main thread) so concurrent workers don't race on
+            # writing the queue file. Cheap enough to do per row change.
+            _persist_queue(self.rows)
         self.after(0, update)
 
     def _on_tree_select(self, _event=None) -> None:
@@ -850,9 +1047,22 @@ class LabelerApp(tk.Tk):
     # ---- Actions ---------------------------------------------------------
 
     def clear_rows(self) -> None:
+        if not self.rows:
+            return
+        # Two-click destruction. Message spells out that PDFs on disk are
+        # untouched — only queue entries and any AI-inferred fields are lost.
+        if not messagebox.askyesno(
+            "Clear queue",
+            f"Clear {len(self.rows)} file(s) from the queue?\n\n"
+            "Files already renamed on disk stay put. Unfinished rows lose "
+            "their Name / Type / Dates — you'll need to re-scan to get them "
+            "back.",
+        ):
+            return
         for r in self.rows:
             self.tree.delete(r.iid)
         self.rows.clear()
+        _persist_queue(self.rows)
         self._set_global_status("Cleared.")
 
     def rescan_selected(self) -> None:
