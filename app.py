@@ -163,10 +163,11 @@ class PreviewPane(ttk.Frame):
     _IMG_CACHE_LIMIT = 8       # path → PIL.Image, evicted LRU-style
     _RENDER_DPI      = 110     # preview quality; bumps fidelity vs. speed
 
-    def __init__(self, parent, app, on_save_one):
+    def __init__(self, parent, app, on_save_one, on_next=None):
         super().__init__(parent)
         self._app = app
         self._on_save_one = on_save_one
+        self._on_next = on_next
         self._row: Optional[Row] = None
         self._page = 1
         self._page_count = 1
@@ -234,9 +235,24 @@ class PreviewPane(ttk.Frame):
 
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        # Rightmost = the button you'll hit most: save this file and jump
+        # straight to the next one that still needs work.
+        self._save_next_btn = ttk.Button(btn_row, text="Save & Next \u25b6",
+                                         command=self._save_next_clicked, state="disabled")
+        self._save_next_btn.pack(side="right")
         self._save_btn = ttk.Button(btn_row, text="Save & Rename This File",
                                     command=self._save_clicked, state="disabled")
-        self._save_btn.pack(side="right")
+        self._save_btn.pack(side="right", padx=(0, 6))
+        self._skip_btn = ttk.Button(btn_row, text="Skip \u25b6", width=8,
+                                    command=self._skip_clicked, state="disabled")
+        self._skip_btn.pack(side="left")
+
+        # Keyboard shortcut for the same thing — bound to the pane's own
+        # widgets (not bind_all) so dialogs elsewhere keep their Enter key.
+        for w in (self, self._name_entry, self._type_combo,
+                  self._dates_entry, self._canvas):
+            for seq in ("<Command-Return>", "<Control-Return>"):
+                w.bind(seq, self._save_next_key)
 
         self._set_enabled(False)
 
@@ -388,6 +404,8 @@ class PreviewPane(ttk.Frame):
         self._type_combo.configure(state=("readonly" if on else "disabled"))
         self._dates_entry.configure(state=state)
         self._save_btn.configure(state=state)
+        self._save_next_btn.configure(state=state)
+        self._skip_btn.configure(state=state)
         self._prev_btn.configure(state="disabled")
         self._next_btn.configure(state="disabled")
 
@@ -395,6 +413,26 @@ class PreviewPane(ttk.Frame):
         if self._row is None:
             return
         self._on_save_one(self._row)
+
+    def _save_next_clicked(self) -> None:
+        """Save this file, then move the selection to the next one.
+
+        Only advances when the rename actually succeeded — a failed or
+        incomplete save leaves you on the row so you can fix it."""
+        if self._row is None:
+            return
+        if self._on_save_one(self._row) and self._on_next is not None:
+            self._on_next(self._row)
+
+    def _skip_clicked(self) -> None:
+        """Move on without saving (e.g. a file you'll come back to)."""
+        if self._row is not None and self._on_next is not None:
+            self._on_next(self._row)
+
+    def _save_next_key(self, _event=None):
+        if self._row is not None and str(self._save_next_btn["state"]) != "disabled":
+            self._save_next_clicked()
+        return "break"
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +711,8 @@ class LabelerApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         # Preview + editor on the right.
-        self.preview = PreviewPane(paned, app=self, on_save_one=self._rename_one)
+        self.preview = PreviewPane(paned, app=self, on_save_one=self._rename_one,
+                                   on_next=self.select_next_row)
         paned.add(self.preview, weight=2)
 
         # Status bar
@@ -1080,21 +1119,24 @@ class LabelerApp(tk.Tk):
         if paths:
             threading.Thread(target=self._process_rows, args=(paths,), daemon=True).start()
 
-    def _rename_one(self, row: Row) -> None:
+    def _rename_one(self, row: Row) -> bool:
         """Rename a single file in place. Triggered from the preview pane's
         Save button — lets the user commit edits one at a time after eyeballing
-        the page next to the proposed filename."""
+        the page next to the proposed filename.
+
+        Returns True when the file is on disk under its new name, so the
+        "Save & Next" caller knows whether it may advance."""
         proposed = row.proposed_filename()
         if not proposed:
             messagebox.showwarning(
                 "Incomplete",
                 "Fill Name, Type and at least one Date before saving.",
             )
-            return
+            return False
         if row.status == "renamed":
             messagebox.showinfo("Already renamed",
                                 f"This file was already renamed to:\n{os.path.basename(row.path)}")
-            return
+            return False
         folder = os.path.dirname(row.path)
         target = self._unique_path(os.path.join(folder, proposed))
         try:
@@ -1103,11 +1145,37 @@ class LabelerApp(tk.Tk):
             row.status = f"error: {e}"
             self._refresh_row(row)
             messagebox.showerror("Rename failed", str(e))
-            return
+            return False
         row.path = target
         row.status = "renamed"
         self._refresh_row(row, update_preview=True)
         self._set_global_status(f"Renamed → {os.path.basename(target)}")
+        return True
+
+    def select_next_row(self, current: Row) -> None:
+        """Select the next file below `current` that still needs work.
+
+        Skips rows already renamed so a long finished stretch doesn't make you
+        click through it. Falls back to the very next row if everything below
+        is done, and stays put at the end of the list."""
+        iids = list(self.tree.get_children(""))
+        try:
+            start = iids.index(current.iid) + 1
+        except ValueError:
+            return
+        rest = iids[start:]
+        if not rest:
+            self._set_global_status("Last file in the list — nothing after this one.")
+            return
+        target = next(
+            (i for i in rest
+             if (r := self._row_for_iid(i)) is not None and r.status != "renamed"),
+            rest[0],
+        )
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self.tree.see(target)
+        # selection_set fires <<TreeviewSelect>>, which swaps the preview.
 
     def apply_rename(self) -> None:
         ready = [r for r in self.rows if r.proposed_filename() and r.status != "renamed"]
