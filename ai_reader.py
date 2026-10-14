@@ -29,7 +29,6 @@ from typing import Any, Dict, List
 
 from formatter import FileLabel, VALID_TYPES
 
-
 # ---------------------------------------------------------------------------
 # Settings persistence
 # ---------------------------------------------------------------------------
@@ -40,7 +39,7 @@ NAMES_FILE = SETTINGS_DIR / "names.txt"
 CLIENTS_FILE = SETTINGS_DIR / "clients.txt"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "provider":  "gemini",     # "gemini" | "claude" | "tesseract"
+    "provider": "gemini",  # "gemini" | "claude" | "tesseract"
     "gemini_api_key": "",
     "gemini_model": "gemini-2.5-flash",
     "claude_api_key": "",
@@ -134,7 +133,7 @@ def names_from_docx(path: str) -> List[str]:
     seen: set = set()
 
     def add(value: str) -> None:
-        v = " ".join(value.split())
+        v = " ".join(value.split())  # this line feel redundant why not keep value
         if v and v.lower() not in seen:
             seen.add(v.lower())
             out.append(v)
@@ -173,6 +172,7 @@ def _bootstrap_from_local_docx() -> List[str]:
 # who receive the service (the "Client Name:" on the other four form types).
 # Separating them keeps each prompt short and stops the model from biasing a
 # client read toward an employee spelling, or vice versa.
+
 
 def load_known_clients() -> List[str]:
     if not CLIENTS_FILE.exists():
@@ -296,8 +296,8 @@ def load_settings() -> Dict[str, Any]:
         pass
     # Env vars override whatever is in the file
     if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-        settings["gemini_api_key"] = (
-            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        settings["gemini_api_key"] = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+            "GOOGLE_API_KEY"
         )
     if os.environ.get("ANTHROPIC_API_KEY"):
         settings["claude_api_key"] = os.environ["ANTHROPIC_API_KEY"]
@@ -309,7 +309,7 @@ def save_settings(settings: Dict[str, Any]) -> None:
     with SETTINGS_FILE.open("w") as fh:
         json.dump(settings, fh, indent=2)
     try:
-        os.chmod(SETTINGS_FILE, 0o600)   # API keys are sensitive
+        os.chmod(SETTINGS_FILE, 0o600)  # API keys are sensitive
     except OSError:
         pass
 
@@ -431,17 +431,17 @@ _MONTH_HINT = """\
 
 
 def build_prompt(
-    employees:  List[str] = (),
-    clients:    List[str] = (),
+    employees: List[str] = (),
+    clients: List[str] = (),
     year_range: "tuple[int, int] | None" = None,
-    months:     "list[int] | None"       = None,
+    months: "list[int] | None" = None,
 ) -> str:
     """Return the user prompt with roster + year + month hints when provided."""
     out = USER_PROMPT
     if employees or clients:
         out += _ROSTER_HINT.format(
             employees_list=", ".join(f'"{n}"' for n in employees) or "(none provided)",
-            clients_list  =", ".join(f'"{n}"' for n in clients)   or "(none provided)",
+            clients_list=", ".join(f'"{n}"' for n in clients) or "(none provided)",
         )
     if year_range is not None:
         lo, hi = year_range
@@ -458,6 +458,7 @@ def build_prompt(
 # Shared response parsing
 # ---------------------------------------------------------------------------
 
+
 def _parse_json_block(text: str) -> Dict[str, Any]:
     text = text.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```\s*$", text, re.S)
@@ -465,9 +466,9 @@ def _parse_json_block(text: str) -> Dict[str, Any]:
         text = fence.group(1)
     if not text.startswith("{"):
         start = text.find("{")
-        end   = text.rfind("}")
+        end = text.rfind("}")
         if start != -1 and end > start:
-            text = text[start:end + 1]
+            text = text[start : end + 1]
     return json.loads(text)
 
 
@@ -503,6 +504,7 @@ def _label_from_data(data: Dict[str, Any], source_path: str) -> FileLabel:
 # Gemini (Google AI Studio) -- free tier
 # ---------------------------------------------------------------------------
 
+
 def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     try:
         import google.generativeai as genai
@@ -532,10 +534,12 @@ def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(3):
         try:
-            response = model.generate_content([
-                {"mime_type": "application/pdf", "data": pdf_bytes},
-                prompt,
-            ])
+            response = model.generate_content(
+                [
+                    {"mime_type": "application/pdf", "data": pdf_bytes},
+                    prompt,
+                ]
+            )
             break
         except Exception as e:
             last_exc = e
@@ -561,6 +565,7 @@ def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
 # Claude (Anthropic) -- paid
 # ---------------------------------------------------------------------------
 
+
 def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     try:
         import anthropic
@@ -584,21 +589,30 @@ def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
         model=model_name,
         max_tokens=800,
         system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document",
-                 "source": {"type": "base64",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
                             "media_type": "application/pdf",
-                            "data": pdf_b64}},
-                {"type": "text", "text": build_prompt(
-                    load_known_names(),
-                    load_known_clients(),
-                    parse_year_range(settings.get("expected_years", "")),
-                    parse_month_set(settings.get("expected_months", "")),
-                )},
-            ],
-        }],
+                            "data": pdf_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": build_prompt(
+                            load_known_names(),
+                            load_known_clients(),
+                            parse_year_range(settings.get("expected_years", "")),
+                            parse_month_set(settings.get("expected_months", "")),
+                        ),
+                    },
+                ],
+            }
+        ],
     )
     text_blocks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
     raw = "\n".join(text_blocks).strip()
@@ -610,12 +624,11 @@ def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+
 def analyze_pdf(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     provider = settings.get("provider", "gemini")
     if provider == "gemini":
         return _analyze_gemini(pdf_path, settings)
     if provider == "claude":
         return _analyze_claude(pdf_path, settings)
-    raise RuntimeError(
-        f"AI provider '{provider}' is not one of 'gemini' or 'claude'."
-    )
+    raise RuntimeError(f"AI provider '{provider}' is not one of 'gemini' or 'claude'.")
