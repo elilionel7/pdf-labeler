@@ -17,8 +17,9 @@ import json
 import os
 import re
 import threading
+import time
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
@@ -64,6 +65,23 @@ def parse_dates_field(raw: str) -> List[date]:
     return out
 
 
+def fmt_duration(seconds: float) -> str:
+    """Compact human duration: "8s", "2m 05s", "1h 02m 03s"."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
+
+
+def fmt_clock(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
 # ---------------------------------------------------------------------------
 # Queue persistence
 # ---------------------------------------------------------------------------
@@ -96,6 +114,15 @@ def _serialize_rows(rows: List["Row"]) -> List[Dict[str, Any]]:
             "ftype":  r.ftype,
             "dates":  [d.isoformat() for d in r.dates],
             "status": r.status,
+            "session":        r.session,
+            "llm_seconds":    round(r.llm_seconds, 2),
+            "review_seconds": round(r.review_seconds, 2),
+            "ai_guess": None if r.ai_guess is None else {
+                "name":  r.ai_guess[0],
+                "ftype": r.ai_guess[1],
+                "dates": [d.isoformat() for d in r.ai_guess[2]],
+            },
+            "edited": r.edited,
             "size":   fp["size"]  if fp else None,
             "mtime":  fp["mtime"] if fp else None,
         })
@@ -125,11 +152,74 @@ def _load_persisted_queue() -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Work sessions + metrics
+# ---------------------------------------------------------------------------
+#
+# A session is one batch of work: it starts when files are added to an empty
+# (or finished) queue and ends when every file in it is renamed. Its timer only
+# counts while running, so breaks don't inflate the numbers. Finished sessions
+# are appended to metrics.jsonl — deliberately without names or paths, since
+# the documents are client records.
+
+SESSION_FILE = Path.home() / ".pdf-labeler" / "session.json"
+METRICS_FILE = Path.home() / ".pdf-labeler" / "metrics.jsonl"
+
+
+class WorkSession:
+    def __init__(self, sid: str = "", started_at: str = "",
+                 active_seconds: float = 0.0, ended: bool = False):
+        now = datetime.now()
+        self.id = sid or now.strftime("%Y%m%d-%H%M%S")
+        self.started_at = started_at or now.isoformat(timespec="seconds")
+        self.active_seconds = active_seconds
+        self.ended = ended
+        # Never restored as running — if the app was closed, you weren't working.
+        self.running = False
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"id": self.id, "started_at": self.started_at,
+                "active_seconds": round(self.active_seconds, 2),
+                "ended": self.ended}
+
+
+def _persist_session(session: Optional[WorkSession]) -> None:
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if session is None:
+            SESSION_FILE.unlink(missing_ok=True)
+            return
+        with SESSION_FILE.open("w") as fh:
+            json.dump(session.to_json(), fh, indent=2)
+    except OSError:
+        pass
+
+
+def _load_persisted_session() -> Optional[WorkSession]:
+    try:
+        with SESSION_FILE.open("r") as fh:
+            d = json.load(fh)
+        return WorkSession(str(d["id"]), str(d["started_at"]),
+                           float(d.get("active_seconds", 0)), bool(d.get("ended")))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _append_metrics(record: Dict[str, Any]) -> None:
+    try:
+        METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with METRICS_FILE.open("a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Per-row data
 # ---------------------------------------------------------------------------
 
 class Row:
-    __slots__ = ("path", "name", "ftype", "dates", "status", "iid")
+    __slots__ = ("path", "name", "ftype", "dates", "status", "iid",
+                 "session", "llm_seconds", "review_seconds", "ai_guess", "edited")
 
     def __init__(self, path: str):
         self.path: str = path
@@ -138,6 +228,15 @@ class Row:
         self.dates: List[date] = []
         self.status: str = "pending"
         self.iid:    str = ""
+        self.session: str = ""                 # WorkSession.id this row belongs to
+        self.llm_seconds: float = 0.0          # time spent in the AI / OCR read
+        self.review_seconds: float = 0.0       # time open in the preview, timer running
+        # What the reader suggested, to tell at rename time if you corrected it.
+        self.ai_guess: Optional[tuple] = None  # (name, ftype, tuple(dates))
+        self.edited: bool = False
+
+    def current_label(self) -> tuple:
+        return (self.name, self.ftype, tuple(self.dates))
 
     def proposed_filename(self) -> Optional[str]:
         if not (self.name and self.ftype and self.dates):
@@ -387,6 +486,7 @@ class PreviewPane(ttk.Frame):
         self._row.ftype = self._type_var.get().strip()
         self._row.dates = parse_dates_field(self._dates_var.get())
         self._row.status = self._app._status_for(self._row)
+        self._app._note_activity()
         self._app._refresh_row(self._row)
         self._refresh_proposed()
 
@@ -662,9 +762,16 @@ class LabelerApp(tk.Tk):
         # running, cleared = paused. Starts running so first batch just flows.
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self.session: Optional[WorkSession] = None
+        self._last_tick = time.monotonic()
+        self._ticks_since_save = 0
         self._build_ui()
         self._update_reader_label()
         self._restore_queue()
+        self._restore_session()
+        self._update_stats_bar()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(1000, self._tick)
 
     # ---- UI construction -------------------------------------------------
 
@@ -676,12 +783,31 @@ class LabelerApp(tk.Tk):
         ttk.Button(top, text="Add Folder",       command=self.add_folder).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear",            command=self.clear_rows).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Re-scan Selected", command=self.rescan_selected).pack(side="left", padx=(20, 0))
-        self._pause_btn = ttk.Button(top, text="Pause", command=self._toggle_pause)
+        self._pause_btn = ttk.Button(top, text="Pause AI", command=self._toggle_pause)
         self._pause_btn.pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clients…",         command=self.open_clients).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Employees…",       command=self.open_names).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Settings…",        command=self.open_settings).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Apply Rename",     command=self.apply_rename).pack(side="right")
+
+        # Progress + work timer strip.
+        stats = ttk.Frame(self)
+        stats.pack(fill="x", padx=10, pady=(0, 6))
+        self.progress_var = tk.StringVar(value="Remaining: –")
+        ttk.Label(stats, textvariable=self.progress_var,
+                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        self._progress_bar = ttk.Progressbar(stats, length=160, mode="determinate")
+        self._progress_bar.pack(side="left", padx=(8, 20))
+        self.timer_var = tk.StringVar(value="\u23f1 00:00:00")
+        self._timer_label = ttk.Label(stats, textvariable=self.timer_var,
+                                      font=("TkFixedFont", 13))
+        self._timer_label.pack(side="left")
+        self._timer_btn = ttk.Button(stats, text="Pause Timer", width=13,
+                                     command=self._toggle_timer, state="disabled")
+        self._timer_btn.pack(side="left", padx=(6, 20))
+        self.metrics_var = tk.StringVar(value="")
+        ttk.Label(stats, textvariable=self.metrics_var,
+                  foreground="#555").pack(side="left")
 
         # Split: table on the left, PDF preview + editor on the right.
         paned = ttk.PanedWindow(self, orient="horizontal")
@@ -757,13 +883,13 @@ class LabelerApp(tk.Tk):
     def _toggle_pause(self) -> None:
         if self._pause_event.is_set():
             self._pause_event.clear()
-            self._pause_btn.configure(text="Resume")
+            self._pause_btn.configure(text="Resume AI")
             self._set_global_status(
                 "Paused. Current file will finish, then processing stops."
             )
         else:
             self._pause_event.set()
-            self._pause_btn.configure(text="Pause")
+            self._pause_btn.configure(text="Pause AI")
             # Worker (if any) picks up on next iteration.
 
     # ---- Queue restore ---------------------------------------------------
@@ -822,6 +948,20 @@ class LabelerApp(tk.Tk):
                     row.dates.append(date.fromisoformat(s))
                 except (TypeError, ValueError):
                     pass
+            row.session = str(entry.get("session") or "")
+            try:
+                row.llm_seconds    = float(entry.get("llm_seconds") or 0)
+                row.review_seconds = float(entry.get("review_seconds") or 0)
+            except (TypeError, ValueError):
+                pass
+            guess = entry.get("ai_guess")
+            if isinstance(guess, dict):
+                try:
+                    row.ai_guess = (guess.get("name", ""), guess.get("ftype", ""),
+                                    tuple(date.fromisoformat(x) for x in guess.get("dates", [])))
+                except (TypeError, ValueError):
+                    row.ai_guess = None
+            row.edited = bool(entry.get("edited"))
 
             if not file_exists:
                 row.status = "missing"
@@ -841,6 +981,7 @@ class LabelerApp(tk.Tk):
                     row.name  = ""
                     row.ftype = ""
                     row.dates = []
+                    row.ai_guess = None
                     row.status = "changed — re-scan"
                     changed += 1
                 elif saved_status in ("reading…", "queued", ""):
@@ -897,8 +1038,11 @@ class LabelerApp(tk.Tk):
         new = [p for p in paths if p and os.path.isfile(p)]
         if not new:
             return
+        if self.session is None or self.session.ended:
+            self.session = WorkSession()
         for p in new:
             row = Row(p)
+            row.session = self.session.id
             iid = self.tree.insert("", "end", values=(
                 os.path.basename(p), "", "", "", "", "queued",
             ))
@@ -907,6 +1051,8 @@ class LabelerApp(tk.Tk):
         # Persist immediately so a crash between here and first _refresh_row
         # still preserves the file list.
         _persist_queue(self.rows)
+        self._note_activity()
+        self._update_stats_bar()
         threading.Thread(target=self._process_rows, args=(new,), daemon=True).start()
 
     # ---- Background processing ------------------------------------------
@@ -934,6 +1080,9 @@ class LabelerApp(tk.Tk):
             if row is None:
                 continue
             self._set_status(row, "reading…")
+            # Timed independently of the work timer: this is how long the
+            # reader itself took, whether or not you were at the desk.
+            t0 = time.perf_counter()
             try:
                 label = self._analyze(p)
             except ImportError as e:
@@ -942,9 +1091,12 @@ class LabelerApp(tk.Tk):
             except Exception as e:
                 self._mark_error(row, f"{type(e).__name__}: {e}")
                 continue
+            finally:
+                row.llm_seconds += time.perf_counter() - t0
             row.name  = label.full_name
             row.ftype = label.file_type
             row.dates = label.dates
+            row.ai_guess = row.current_label()
             self._refresh_row(row,
                               status=self._status_for(row),
                               update_preview=True)
@@ -998,6 +1150,8 @@ class LabelerApp(tk.Tk):
             # Persist here (main thread) so concurrent workers don't race on
             # writing the queue file. Cheap enough to do per row change.
             _persist_queue(self.rows)
+            self._update_stats_bar()
+            self._check_session_done()
         self.after(0, update)
 
     def _on_tree_select(self, _event=None) -> None:
@@ -1006,6 +1160,7 @@ class LabelerApp(tk.Tk):
             self.preview.show_row(None)
             return
         row = self._row_for_iid(iids[0])
+        self._note_activity()
         self.preview.show_row(row)
 
     def _set_status(self, row: Row, status: str) -> None:
@@ -1073,6 +1228,7 @@ class LabelerApp(tk.Tk):
         elif col_name == "dates":
             row.dates = parse_dates_field(value)
         row.status = self._status_for(row)
+        self._note_activity()
         # Inline edit commits a finalised value (Enter / FocusOut) — safe to
         # push into the preview pane so its fields don't lag the table.
         self._refresh_row(row, update_preview=True)
@@ -1098,10 +1254,19 @@ class LabelerApp(tk.Tk):
             "back.",
         ):
             return
+        # Clearing mid-batch still logs the work done so far (marked
+        # incomplete); a batch with nothing renamed isn't worth a record.
+        s = self.session
+        if s is not None and not s.ended:
+            if any(r.status == "renamed" for r in self._session_rows()):
+                self._finish_session(completed=False)
+        self.session = None
+        _persist_session(None)
         for r in self.rows:
             self.tree.delete(r.iid)
         self.rows.clear()
         _persist_queue(self.rows)
+        self._update_stats_bar()
         self._set_global_status("Cleared.")
 
     def rescan_selected(self) -> None:
@@ -1113,6 +1278,7 @@ class LabelerApp(tk.Tk):
                 r.name = ""
                 r.ftype = ""
                 r.dates = []
+                r.ai_guess = None
                 r.status = "queued"
                 self._refresh_row(r, update_preview=True)
                 paths.append(r.path)
@@ -1137,6 +1303,7 @@ class LabelerApp(tk.Tk):
             messagebox.showinfo("Already renamed",
                                 f"This file was already renamed to:\n{os.path.basename(row.path)}")
             return False
+        self._note_activity()
         folder = os.path.dirname(row.path)
         target = self._unique_path(os.path.join(folder, proposed))
         try:
@@ -1147,6 +1314,7 @@ class LabelerApp(tk.Tk):
             messagebox.showerror("Rename failed", str(e))
             return False
         row.path = target
+        row.edited = row.ai_guess != row.current_label()
         row.status = "renamed"
         self._refresh_row(row, update_preview=True)
         self._set_global_status(f"Renamed → {os.path.basename(target)}")
@@ -1186,6 +1354,7 @@ class LabelerApp(tk.Tk):
         if not messagebox.askyesno("Confirm rename",
                                    f"Rename {len(ready)} file(s) on disk?"):
             return
+        self._note_activity()
         renamed = 0
         for r in ready:
             new_name = r.proposed_filename()
@@ -1195,12 +1364,178 @@ class LabelerApp(tk.Tk):
             try:
                 os.rename(r.path, target)
                 r.path = target
+                r.edited = r.ai_guess != r.current_label()
                 r.status = "renamed"
                 renamed += 1
             except OSError as e:
                 r.status = f"error: {e}"
             self._refresh_row(r, update_preview=True)
         self._set_global_status(f"Renamed {renamed}/{len(ready)} file(s).")
+
+    # ---- Work session: progress, timer, metrics -------------------------
+
+    def _restore_session(self) -> None:
+        self.session = _load_persisted_session()
+        # Rows from before session tracking existed: adopt them into a fresh
+        # session so the counter reflects what's left.
+        orphans = [r for r in self.rows if not r.session]
+        if orphans and any(r.status != "renamed" for r in orphans):
+            if self.session is None or self.session.ended:
+                self.session = WorkSession()
+            for r in orphans:
+                r.session = self.session.id
+        if self.session is not None and not self.session.ended \
+                and any(r.status != "renamed" for r in self._session_rows()):
+            self._set_global_status(
+                "Unfinished batch restored — timer is paused until you resume or "
+                "start working.")
+        _persist_session(self.session)
+
+    def _session_rows(self) -> List[Row]:
+        if self.session is None:
+            return []
+        return [r for r in self.rows if r.session == self.session.id]
+
+    def _note_activity(self) -> None:
+        """You're clearly working — resume a paused timer so forgetting to
+        hit Resume after a break doesn't lose time. Pausing stays manual."""
+        s = self.session
+        if s is not None and not s.ended and not s.running:
+            s.running = True
+            self._last_tick = time.monotonic()
+            _persist_session(s)
+            self._update_stats_bar()
+
+    def _toggle_timer(self) -> None:
+        s = self.session
+        if s is None or s.ended:
+            return
+        s.running = not s.running
+        self._last_tick = time.monotonic()
+        _persist_session(s)
+        self._update_stats_bar()
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+        # Clamp so a stalled event loop or laptop sleep doesn't add a huge jump.
+        dt = min(now - self._last_tick, 5.0)
+        self._last_tick = now
+        s = self.session
+        if s is not None and s.running and not s.ended:
+            s.active_seconds += dt
+            row = self.preview._row
+            if row is not None and row.session == s.id and row.status != "renamed":
+                row.review_seconds += dt
+            self._ticks_since_save += 1
+            if self._ticks_since_save >= 15:
+                self._ticks_since_save = 0
+                _persist_session(s)
+                _persist_queue(self.rows)
+            self._update_stats_bar()
+        self.after(1000, self._tick)
+
+    def _update_stats_bar(self) -> None:
+        s = self.session
+        rows = self._session_rows()
+        if s is None or not rows:
+            self.progress_var.set("Remaining: –")
+            self._progress_bar.configure(value=0, maximum=1)
+            self.timer_var.set("\u23f1 00:00:00")
+            self._timer_btn.configure(text="Pause Timer", state="disabled")
+            self.metrics_var.set("")
+            return
+        total = len(rows)
+        done = [r for r in rows if r.status == "renamed"]
+        remaining = total - len(done)
+        self.progress_var.set("All done \u2713" if remaining == 0 and s.ended
+                              else f"Remaining: {remaining} / {total}")
+        self._progress_bar.configure(value=len(done), maximum=total)
+
+        suffix = "" if s.running or s.ended else "  (paused)"
+        self.timer_var.set(f"\u23f1 {fmt_clock(s.active_seconds)}{suffix}")
+        self._timer_label.configure(foreground="#333" if s.running or s.ended else "#b36b00")
+        if s.ended:
+            self._timer_btn.configure(text="Finished", state="disabled")
+        else:
+            self._timer_btn.configure(text="Pause Timer" if s.running else "Resume Timer",
+                                      state="normal")
+
+        ai = sum(r.llm_seconds for r in rows)
+        review = sum(r.review_seconds for r in rows)
+        parts = [f"AI read: {fmt_duration(ai)}", f"Review: {fmt_duration(review)}"]
+        if done:
+            parts.append(f"Edited: {sum(r.edited for r in done)}/{len(done)}")
+        self.metrics_var.set("   \u00b7   ".join(parts))
+
+    def _check_session_done(self) -> None:
+        s = self.session
+        if s is None or s.ended:
+            return
+        rows = self._session_rows()
+        if rows and all(r.status == "renamed" for r in rows):
+            self._finish_session(completed=True)
+
+    def _finish_session(self, completed: bool) -> None:
+        s = self.session
+        assert s is not None
+        s.running = False
+        s.ended = True
+        rows = self._session_rows()
+        done = [r for r in rows if r.status == "renamed"]
+        ai = sum(r.llm_seconds for r in rows)
+        ai_files = sum(1 for r in rows if r.llm_seconds > 0)
+        review = sum(r.review_seconds for r in rows)
+        edited = sum(1 for r in done if r.edited)
+        provider = self.settings.get("provider", "gemini")
+        _append_metrics({
+            "session_id":     s.id,
+            "started_at":     s.started_at,
+            "ended_at":       datetime.now().isoformat(timespec="seconds"),
+            "completed":      completed,
+            "provider":       provider,
+            "model":          self.settings.get(f"{provider}_model", ""),
+            "files_total":    len(rows),
+            "files_renamed":  len(done),
+            "files_edited":   edited,
+            "active_seconds": round(s.active_seconds, 1),
+            "ai_seconds":     round(ai, 1),
+            "ai_files":       ai_files,
+            "review_seconds": round(review, 1),
+            # Per-file timings for distributions — no names or paths.
+            "files": [{
+                "type":           r.ftype,
+                "renamed":        r.status == "renamed",
+                "edited":         r.edited,
+                "ai_seconds":     round(r.llm_seconds, 2),
+                "review_seconds": round(r.review_seconds, 2),
+            } for r in rows],
+        })
+        _persist_session(s)
+        _persist_queue(self.rows)
+        self._update_stats_bar()
+        if not completed:
+            return
+        n = len(done)
+        lines = [
+            f"All {n} file(s) renamed.",
+            "",
+            f"Work time:     {fmt_duration(s.active_seconds)}"
+            f"  ({fmt_duration(s.active_seconds / n)} per file)",
+            f"AI read time:  {fmt_duration(ai)}"
+            + (f"  ({fmt_duration(ai / ai_files)} per file)" if ai_files else ""),
+            f"Review time:   {fmt_duration(review)}",
+            f"AI suggestions you edited: {edited} of {n}",
+            "",
+            f"Logged to {METRICS_FILE}",
+        ]
+        messagebox.showinfo("Batch complete", "\n".join(lines))
+
+    def _on_close(self) -> None:
+        if self.session is not None:
+            self.session.running = False
+            _persist_session(self.session)
+        _persist_queue(self.rows)
+        self.destroy()
 
     @staticmethod
     def _unique_path(path: str) -> str:

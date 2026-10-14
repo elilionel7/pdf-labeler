@@ -82,6 +82,12 @@ source .venv/bin/activate
 python3 app.py
 ```
 
+Or, to launch it like a normal Mac app (Finder, Spotlight, Dock), run
+`./make_app.sh` once. It creates `~/Applications/PDF Labeler.app`.
+Your code changes take effect the next time you open the app, so you
+don't need to rebuild it. Errors are written to
+`~/.pdf-labeler/app.log`.
+
 First run:
 
 1. Click **Settings…** (top right).
@@ -109,6 +115,28 @@ Rows are colour-coded:
 - green = ready to rename
 - blue = already renamed
 - red = error (look at the Status column)
+
+### Progress, timer and metrics
+
+The strip above the table shows **Remaining: 9 / 10** for the current
+batch, a work timer, and running totals.
+
+- **Work timer** starts when you add files. Click **Pause Timer** when
+  you take a break. It resumes on its own as soon as you select, edit or
+  rename a file, so forgetting to press Resume doesn't lose time. It stops
+  when every file in the batch is renamed. (**Pause AI** is separate: it
+  only pauses background reading.)
+- **AI read** is the time the reader itself spent on each file. It is
+  measured whether or not the work timer is running.
+- **Review** is the time each file spent open in the preview pane while
+  the timer was running.
+- **Edited** is how many renamed files you changed from the AI's
+  suggestion.
+
+When a batch finishes, the app shows a summary and appends a record to
+`~/.pdf-labeler/metrics.jsonl`. That is one JSON line per batch with
+totals and per-file timings. It contains no names or file paths. Clearing
+a half-finished batch also logs it, with `"completed": false`.
 
 ---
 
