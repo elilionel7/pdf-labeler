@@ -43,7 +43,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gemini_api_key": "",
     "gemini_model": "gemini-2.5-flash",
     "claude_api_key": "",
-    "claude_model": "claude-haiku-4-5",
+    "claude_model": "claude-haiku-5-5",
     # Hint for handwriting-ambiguous year digits. A single year ("2026") or
     # a range ("2025-2026") for forms that may straddle Dec/Jan. Empty = off.
     "expected_years": "2026",
@@ -566,6 +566,15 @@ def _analyze_gemini(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
 # ---------------------------------------------------------------------------
 
 
+def _claude_request_options(model_name: str) -> Dict[str, Any]:
+    # Newer models think before answering, and that thinking counts toward
+    # max_tokens -- 800 can cut the JSON off. Low effort is plenty for a form.
+    # Haiku 4.5 predates the effort option and rejects it.
+    if model_name.startswith("claude-haiku-4-5"):
+        return {"max_tokens": 800}
+    return {"max_tokens": 3000, "output_config": {"effort": "low"}}
+
+
 def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
     try:
         import anthropic
@@ -587,8 +596,8 @@ def _analyze_claude(pdf_path: str, settings: Dict[str, Any]) -> FileLabel:
 
     resp = client.messages.create(
         model=model_name,
-        max_tokens=800,
         system=SYSTEM_PROMPT,
+        **_claude_request_options(model_name),
         messages=[
             {
                 "role": "user",

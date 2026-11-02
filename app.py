@@ -588,7 +588,7 @@ class SettingsDialog(tk.Toplevel):
         self.claude_entry.grid(row=5, column=1, sticky="we", **pad)
 
         ttk.Label(self, text="Claude model:").grid(row=6, column=0, sticky="w", **pad)
-        self.claude_model = tk.StringVar(value=self._settings.get("claude_model", "claude-haiku-4-5"))
+        self.claude_model = tk.StringVar(value=self._settings.get("claude_model", "claude-haiku-5-5"))
         self.claude_model_entry = ttk.Entry(self, textvariable=self.claude_model, width=30)
         self.claude_model_entry.grid(row=6, column=1, sticky="w", **pad)
 
@@ -638,7 +638,7 @@ class SettingsDialog(tk.Toplevel):
             "gemini_api_key":  self.gemini_key.get().strip(),
             "gemini_model":    self.gemini_model.get().strip() or "gemini-2.5-flash",
             "claude_api_key":  self.claude_key.get().strip(),
-            "claude_model":    self.claude_model.get().strip() or "claude-haiku-4-5",
+            "claude_model":    self.claude_model.get().strip() or "claude-haiku-5-5",
             "expected_years":  self.years_var.get().strip(),
             "expected_months": self.months_var.get().strip(),
         }

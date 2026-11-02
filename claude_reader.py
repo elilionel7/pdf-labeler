@@ -29,7 +29,7 @@ from formatter import FileLabel, VALID_TYPES
 _API_KEY_OVERRIDE: Optional[str] = None
 
 # The cheapest, fastest vision-capable model is fine for reading forms.
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "claude-haiku-5-5"
 
 
 def set_api_key(key: Optional[str]) -> None:
@@ -164,8 +164,10 @@ def analyze_pdf(pdf_path: str, *, model: str = DEFAULT_MODEL) -> FileLabel:
 
     resp = client.messages.create(
         model=model,
-        max_tokens=400,
         system=_SYSTEM_PROMPT,
+        # Haiku 4.5 rejects `effort`; newer models need room for their thinking.
+        **({"max_tokens": 400} if model.startswith("claude-haiku-4-5")
+           else {"max_tokens": 3000, "output_config": {"effort": "low"}}),
         messages=[{
             "role": "user",
             "content": [
