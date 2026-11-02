@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -419,7 +420,8 @@ class PreviewPane(ttk.Frame):
             try:
                 img, total = self._get_page_image(path, page)
             except Exception as e:
-                self._app.after(0, lambda: self._show_render_error(str(e)))
+                # Bind now: Python clears `e` when the except block ends.
+                self._app.after(0, lambda msg=str(e): self._show_render_error(msg))
                 return
             self._app.after(0, lambda: self._display_image(path, page, img, total, cw, ch))
 
@@ -1550,7 +1552,33 @@ class LabelerApp(tk.Tk):
             i += 1
 
 
+class _TimestampedStream:
+    """Prefix each line written to stdout/stderr with the local time, so
+    tracebacks in app.log can be matched to a session."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, text: str) -> int:
+        out = []
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start:
+                out.append(datetime.now().strftime("[%Y-%m-%d %H:%M:%S] "))
+            out.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(out))
+        self._stream.flush()
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def main() -> None:
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
+    print("--- PDF Labeler started ---")
     LabelerApp().mainloop()
 
 
